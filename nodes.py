@@ -149,7 +149,11 @@ class DownloadAndLoadFramePackModel:
                 for i, block in enumerate(transformer.transformer_blocks):
                     transformer.transformer_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
 
+            # Aggressive torch.compile Integration
             #transformer = torch.compile(transformer, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+           
+            transformer = torch.compile(transformer, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+
 
         pipe = {
             "transformer": transformer.eval(),
@@ -369,7 +373,8 @@ class FramePackSampler:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
-                "steps": ("INT", {"default": 30, "min": 1}),
+                # "steps": ("INT", {"default": 30, "min": 1}),
+                "steps": ("INT", {"default": 20, "min": 1}),
                 "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
                 "teacache_rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The threshold for the relative L1 loss."}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
