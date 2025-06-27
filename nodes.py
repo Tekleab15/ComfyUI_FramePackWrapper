@@ -19,7 +19,9 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 vae_scaling_factor = 0.476986
 
 from .diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModel
-from .diffusers_helper.memory import DynamicSwapInstaller, move_model_to_device_with_memory_preservation
+# Import the modified memory functions
+from .diffusers_helper.memory import DynamicSwapInstaller, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, unload_complete_models, load_model_as_complete
+# from .diffusers_helper.memory import DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 from .diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from .diffusers_helper.utils import crop_or_pad_yield_mask
 from .diffusers_helper.bucket_tools import find_nearest_bucket
@@ -373,6 +375,7 @@ class FramePackSampler:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
+                # Reducing the number steps to for better performance
                 # "steps": ("INT", {"default": 30, "min": 1}),
                 "steps": ("INT", {"default": 20, "min": 1}),
                 "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
@@ -416,47 +419,60 @@ class FramePackSampler:
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
+        
+        # START CUDA Stream Implementation
+        # 1. Create CUDA Streams
+        compute_stream = torch.cuda.Stream()
+        transfer_stream = torch.cuda.Stream()
+    
+        # Remove redundant model unloading
+        # mm.unload_all_models()
+        # mm.cleanup_models()
+        # mm.soft_empty_cache()
+        
+        # Move transformer to device on the transfer stream
+        with torch.cuda.stream(transfer_stream):
+            move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation, stream=transfer_stream)
+        
+        # Move initial latents and embeds to device on the transfer stream
+        with torch.cuda.stream(transfer_stream):
+            if start_latent is not None:
+                start_latent = start_latent["samples"] * vae_scaling_factor
+            if initial_samples is not None:
+                initial_samples = initial_samples["samples"] * vae_scaling_factor
+            if end_latent is not None:
+                end_latent = end_latent["samples"] * vae_scaling_factor
+            has_end_image = end_latent is not None
+            print("start_latent", start_latent.shape)
+            B, C, T, H, W = start_latent.shape
 
-        mm.unload_all_models()
-        mm.cleanup_models()
-        mm.soft_empty_cache()
-
-        if start_latent is not None:
-            start_latent = start_latent["samples"] * vae_scaling_factor
-        if initial_samples is not None:
-            initial_samples = initial_samples["samples"] * vae_scaling_factor
-        if end_latent is not None:
-            end_latent = end_latent["samples"] * vae_scaling_factor
-        has_end_image = end_latent is not None
-        print("start_latent", start_latent.shape)
-        B, C, T, H, W = start_latent.shape
-
-        if image_embeds is not None:
-            start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(device, base_dtype)
-
-        if has_end_image:
-            assert end_image_embeds is not None
-            end_image_encoder_last_hidden_state = end_image_embeds["last_hidden_state"].to(device, base_dtype)
-        else:
             if image_embeds is not None:
-                end_image_encoder_last_hidden_state = torch.zeros_like(start_image_encoder_last_hidden_state)
+                start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(device, base_dtype)
 
-        llama_vec = positive[0][0].to(device, base_dtype)
-        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
+            if has_end_image:
+                assert end_image_embeds is not None
+                end_image_encoder_last_hidden_state = end_image_embeds["last_hidden_state"].to(device, base_dtype)
+            else:
+                if image_embeds is not None:
+                    end_image_encoder_last_hidden_state = torch.zeros_like(start_image_encoder_last_hidden_state)
 
-        if not math.isclose(cfg, 1.0):
-            llama_vec_n = negative[0][0].to(device, base_dtype)
-            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
-        else:
-            llama_vec_n = torch.zeros_like(llama_vec, device=device)
-            clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
+            llama_vec = positive[0][0].to(device, base_dtype)
+            clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
 
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+            if not math.isclose(cfg, 1.0):
+                llama_vec_n = negative[0][0].to(device, base_dtype)
+                clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
+            else:
+                llama_vec_n = torch.zeros_like(llama_vec, device=device)
+                clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
 
+            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+            llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
+        # Ensure all transfers are complete before computation starts on compute_stream
+        compute_stream.wait_stream(transfer_stream)
+        
         # Sampling
-
         rnd = torch.Generator("cpu").manual_seed(seed)
 
         num_frames = latent_window_size * 4 - 3
@@ -477,8 +493,9 @@ class FramePackSampler:
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
         from latent_preview import prepare_callback
         callback = prepare_callback(patcher, steps)
-
-        move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation)
+        # Move transformer to device on the transfer stream
+        with torch.cuda.stream(transfer_stream):
+            move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation, stream = transfer_stream)
 
         if total_latent_sections > 4:
             # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
@@ -494,115 +511,127 @@ class FramePackSampler:
             is_first_section = latent_padding == latent_paddings[0]
             latent_padding_size = latent_padding * latent_window_size
 
-            if image_embeds is not None:
-                if embed_interpolation != "disabled":
-                    if embed_interpolation == "linear":
-                        if total_latent_sections <= 1:
-                            frac = 1.0  # Handle case with only one section
+            # All tensor operations and model calls within the compute_stream context
+            with torch.cuda.stream(compute_stream):
+                if image_embeds is not None:
+                    if embed_interpolation != "disabled":
+                        if embed_interpolation == "linear":
+                            if total_latent_sections <= 1:
+                                frac = 1.0  # Handle case with only one section
+                            else:
+                                frac = 1 - i / (total_latent_sections - 1)  # going backwards
                         else:
-                            frac = 1 - i / (total_latent_sections - 1)  # going backwards
+                            frac = start_embed_strength if has_end_image else 1.0
+
+                        image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * frac + (1 - frac) * end_image_encoder_last_hidden_state
                     else:
-                        frac = start_embed_strength if has_end_image else 1.0
-
-                    image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * frac + (1 - frac) * end_image_encoder_last_hidden_state
+                        image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * start_embed_strength
                 else:
-                    image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * start_embed_strength
-            else:
-                image_encoder_last_hidden_state = None
+                    image_encoder_last_hidden_state = None
 
-            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
+                print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
 
-            start_latent_frames = T  # 0 or 1
-            indices = torch.arange(0, sum([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                start_latent_frames = T  # 0 or 1
+                indices = torch.arange(0, sum([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-            clean_latents_pre = start_latent.to(history_latents)
-            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-
-            # Use end image latent for the first section if provided
-            if has_end_image and is_first_section:
-                clean_latents_post = end_latent.to(history_latents)
+                clean_latents_pre = start_latent.to(history_latents)
+                clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
                 clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            #vid2vid WIP
+                # Use end image latent for the first section if provided
+                if has_end_image and is_first_section:
+                    clean_latents_post = end_latent.to(history_latents)
+                    clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            if initial_samples is not None:
-                total_length = initial_samples.shape[2]
+                #vid2vid WIP
 
-                # Get the max padding value for normalization
-                max_padding = max(latent_paddings_list)
+                if initial_samples is not None:
+                    total_length = initial_samples.shape[2]
+
+                    # Get the max padding value for normalization
+                    max_padding = max(latent_paddings_list)
+
+                    if is_last_section:
+                        # Last section should capture the end of the sequence
+                        start_idx = max(0, total_length - latent_window_size)
+                    else:
+                        # Calculate windows that distribute more evenly across the sequence
+                        # This normalizes the padding values to create appropriate spacing
+                        if max_padding > 0:  # Avoid division by zero
+                            progress = (max_padding - latent_padding) / max_padding
+                            start_idx = int(progress * max(0, total_length - latent_window_size))
+                        else:
+                            start_idx = 0
+
+                    end_idx = min(start_idx + latent_window_size, total_length)
+                    print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
+                    input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
+
+
+                if use_teacache:
+                    transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
+                else:
+                    transformer.initialize_teacache(enable_teacache=False)
+
+                with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
+                    generated_latents = sample_hunyuan(
+                        transformer=transformer,
+                        sampler=sampler,
+                        initial_latent=input_init_latents if initial_samples is not None else None,
+                        strength=denoise_strength,
+                        width=W * 8,
+                        height=H * 8,
+                        frames=num_frames,
+                        real_guidance_scale=cfg,
+                        distilled_guidance_scale=guidance_scale,
+                        guidance_rescale=0,
+                        shift=shift if shift != 0 else None,
+                        num_inference_steps=steps,
+                        generator=rnd,
+                        prompt_embeds=llama_vec,
+                        prompt_embeds_mask=llama_attention_mask,
+                        prompt_poolers=clip_l_pooler,
+                        negative_prompt_embeds=llama_vec_n,
+                        negative_prompt_embeds_mask=llama_attention_mask_n,
+                        negative_prompt_poolers=clip_l_pooler_n,
+                        device=device,
+                        dtype=base_dtype,
+                        image_embeddings=image_encoder_last_hidden_state,
+                        latent_indices=latent_indices,
+                        clean_latents=clean_latents,
+                        clean_latent_indices=clean_latent_indices,
+                        clean_latents_2x=clean_latents_2x,
+                        clean_latent_2x_indices=clean_latent_2x_indices,
+                        clean_latents_4x=clean_latents_4x,
+                        clean_latent_4x_indices=clean_latent_4x_indices,
+                        callback=callback,
+                    )
 
                 if is_last_section:
-                    # Last section should capture the end of the sequence
-                    start_idx = max(0, total_length - latent_window_size)
-                else:
-                    # Calculate windows that distribute more evenly across the sequence
-                    # This normalizes the padding values to create appropriate spacing
-                    if max_padding > 0:  # Avoid division by zero
-                        progress = (max_padding - latent_padding) / max_padding
-                        start_idx = int(progress * max(0, total_length - latent_window_size))
-                    else:
-                        start_idx = 0
+                    generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
-                end_idx = min(start_idx + latent_window_size, total_length)
-                print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
-                input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
+                total_generated_latent_frames += int(generated_latents.shape[2])
+                history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
+                real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-            if use_teacache:
-                transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
-            else:
-                transformer.initialize_teacache(enable_teacache=False)
+                if is_last_section:
+                    break
+            # END CUDA Stream Implementation for main loop
+        
+        # Offload transformer to offload_device on the transfer stream
+        with torch.cuda.stream(transfer_stream):
+            offload_model_from_device_for_memory_preservation(transformer, target_device=offload_device, preserved_memory_gb=gpu_memory_preservation, stream=transfer_stream)
 
-            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
-                generated_latents = sample_hunyuan(
-                    transformer=transformer,
-                    sampler=sampler,
-                    initial_latent=input_init_latents if initial_samples is not None else None,
-                    strength=denoise_strength,
-                    width=W * 8,
-                    height=H * 8,
-                    frames=num_frames,
-                    real_guidance_scale=cfg,
-                    distilled_guidance_scale=guidance_scale,
-                    guidance_rescale=0,
-                    shift=shift if shift != 0 else None,
-                    num_inference_steps=steps,
-                    generator=rnd,
-                    prompt_embeds=llama_vec,
-                    prompt_embeds_mask=llama_attention_mask,
-                    prompt_poolers=clip_l_pooler,
-                    negative_prompt_embeds=llama_vec_n,
-                    negative_prompt_embeds_mask=llama_attention_mask_n,
-                    negative_prompt_poolers=clip_l_pooler_n,
-                    device=device,
-                    dtype=base_dtype,
-                    image_embeddings=image_encoder_last_hidden_state,
-                    latent_indices=latent_indices,
-                    clean_latents=clean_latents,
-                    clean_latent_indices=clean_latent_indices,
-                    clean_latents_2x=clean_latents_2x,
-                    clean_latent_2x_indices=clean_latent_2x_indices,
-                    clean_latents_4x=clean_latents_4x,
-                    clean_latent_4x_indices=clean_latent_4x_indices,
-                    callback=callback,
-                )
+        # Final synchronization
+        torch.cuda.current_stream().wait_stream(compute_stream)
+        # Also wait for transfer_stream to ensure all offloading is complete
+        torch.cuda.current_stream().wait_stream(transfer_stream)
 
-            if is_last_section:
-                generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
-
-            total_generated_latent_frames += int(generated_latents.shape[2])
-            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
-
-            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
-
-            if is_last_section:
-                break
-
-        transformer.to(offload_device)
-        mm.soft_empty_cache()
+        # transformer.to(offload_device)
+        # mm.soft_empty_cache()
 
         return {"samples": real_history_latents / vae_scaling_factor},
 
@@ -655,252 +684,272 @@ class FramePackSingleFrameSampler:
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
-        mm.unload_all_models()
-        mm.cleanup_models()
-        mm.soft_empty_cache()
+        # START CUDA Stream Implementation for Single Frame Sampler 
+        compute_stream = torch.cuda.Stream()
+        transfer_stream = torch.cuda.Stream()
+        # 2. Remove redundant model unloading
+        # mm.unload_all_models()
+        # mm.cleanup_models()
+        # mm.soft_empty_cache()
 
+        with torch.cuda.stream(transfer_stream):
+            move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation, stream=transfer_stream)
+        
         # Latent processing
-        if start_latent is not None:
-            start_latent = start_latent["samples"] * vae_scaling_factor
-        if initial_samples is not None:
-            initial_samples = initial_samples["samples"] * vae_scaling_factor
-        if use_kisekaeichi and reference_latent is not None:
-            reference_latent = reference_latent["samples"] * vae_scaling_factor
-            log.info(f"Reference image latent shape: {reference_latent.shape}")
+        with torch.cuda.stream(transfer_stream):
+            if start_latent is not None:
+                start_latent = start_latent["samples"] * vae_scaling_factor
+            if initial_samples is not None:
+                initial_samples = initial_samples["samples"] * vae_scaling_factor
+            if use_kisekaeichi and reference_latent is not None:
+                reference_latent = reference_latent["samples"] * vae_scaling_factor
+                log.info(f"Reference image latent shape: {reference_latent.shape}")
 
-        log.info(f"start_latent shape {start_latent.shape}")
-        B, C, T, H, W = start_latent.shape
+            log.info(f"start_latent shape {start_latent.shape}")
+            B, C, T, H, W = start_latent.shape
 
-        # image embeds
-        if image_embeds is not None:
-            start_image_encoder_last_hidden_state = image_embeds[
-                "last_hidden_state"
-            ].to(device, base_dtype)
-        else:
-            start_image_encoder_last_hidden_state = None
+            # image embeds
+            if image_embeds is not None:
+                start_image_encoder_last_hidden_state = image_embeds[
+                    "last_hidden_state"
+                ].to(device, base_dtype)
+            else:
+                start_image_encoder_last_hidden_state = None
 
-        if use_kisekaeichi and reference_image_embeds is not None:
-            reference_image_encoder_last_hidden_state = reference_image_embeds["last_hidden_state"].to(device, base_dtype)
-        else:
-            reference_image_encoder_last_hidden_state = None
+            if use_kisekaeichi and reference_image_embeds is not None:
+                reference_image_encoder_last_hidden_state = reference_image_embeds["last_hidden_state"].to(device, base_dtype)
+            else:
+                reference_image_encoder_last_hidden_state = None
 
-        # text embeds
-        llama_vec = positive[0][0].to(device, base_dtype)
-        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
+            # text embeds
+            llama_vec = positive[0][0].to(device, base_dtype)
+            clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
 
-        if not math.isclose(cfg, 1.0):
-            llama_vec_n = negative[0][0].to(device, base_dtype)
-            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
-        else:
-            llama_vec_n = torch.zeros_like(llama_vec, device=device)
-            clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
+            if not math.isclose(cfg, 1.0):
+                llama_vec_n = negative[0][0].to(device, base_dtype)
+                clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
+            else:
+                llama_vec_n = torch.zeros_like(llama_vec, device=device)
+                clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
 
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+            llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
+        # Ensure all transfers are complete before computation starts on compute_stream
+        compute_stream.wait_stream(transfer_stream)
         rnd = torch.Generator("cpu").manual_seed(seed)
 
         # hard coded single frame settings
         sample_num_frames = 1
         latent_padding = 0
         latent_padding_size = latent_padding * latent_window_size  # 0
+        
+        # All tensor operations and model calls within the compute_stream context
+        with torch.cuda.stream(compute_stream):
+            indices = torch.arange(
+                0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])
+            ).unsqueeze(0)
+            split_sizes = [1, latent_padding_size, latent_window_size, 1, 2, 16]
 
-        indices = torch.arange(
-            0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])
-        ).unsqueeze(0)
-        split_sizes = [1, latent_padding_size, latent_window_size, 1, 2, 16]
-
-        # Splitting when latent_padding_size is 0
-        if latent_padding_size == 0:
-            clean_latent_indices_pre = indices[:, 0:1]
-            latent_indices = indices[:, 1 : 1 + latent_window_size]
-            clean_latent_indices_post = indices[
-                :, 1 + latent_window_size : 2 + latent_window_size
-            ]
-        else:
-            (
-                clean_latent_indices_pre,
-                blank_indices,
-                latent_indices,
-                clean_latent_indices_post,
-                clean_latent_2x_indices,
-                clean_latent_4x_indices,
-            ) = indices.split(split_sizes, dim=1)
-
-        # one_frame_inference
-        if use_kisekaeichi and reference_latent is not None:
-
-            one_frame_inference = set()
-            one_frame_inference.add(f"target_index={target_index}")
-            one_frame_inference.add(f"history_index={history_index}")
-
-            latent_indices = indices[:, -1:]  # Default is the last frame
-
-            # Parameter analysis and processing
-            for one_frame_param in one_frame_inference:
-                if one_frame_param.startswith("target_index="):
-                    target_idx = int(one_frame_param.split("=")[1])
-                    latent_indices[:, 0] = target_idx
-                    log.info(f"Setting latent_indices: target_index={target_idx}")
-
-                elif one_frame_param.startswith("history_index="):
-                    history_idx = int(one_frame_param.split("=")[1])
-                    clean_latent_indices_post[:, 0] = history_idx
-                    log.info(f"Setting clean_latent_indices_post: history_index={history_idx}")
-
-            # dummy history_latents
-            history_latents = torch.zeros(
-                size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32, device="cpu"
-            )
-
-            # Setting clean_latents_pre (input image)
-            clean_latents_pre = start_latent.to(history_latents.dtype).to(
-                history_latents.device
-            )
-            if len(clean_latents_pre.shape) < 5:
-                clean_latents_pre = clean_latents_pre.unsqueeze(2)
-
-            # Applying mask (input image)
-            if input_mask is not None:
-                height_latent, width_latent = clean_latents_pre.shape[-2:]
-                input_mask_resized = (common_upscale(input_mask.unsqueeze(0).unsqueeze(0), width_latent,  height_latent, "bilinear", "center").squeeze(0).squeeze(0))
-                input_mask_resized = input_mask_resized.to(clean_latents_pre.device)[None, None, None, :, :]
-                clean_latents_pre = clean_latents_pre * input_mask_resized
-
-            # Applying mask (reference image)
-            if reference_mask is not None:
-                height_latent, width_latent = clean_latents_post.shape[-2:]
-                reference_mask_resized = (common_upscale(input_mask.unsqueeze(0).unsqueeze(0), width_latent,  height_latent, "bilinear", "center").squeeze(0).squeeze(0))
-                reference_mask_resized = reference_mask_resized.to(clean_latents_post.device)[None, None, None, :, :]
-                clean_latents_post = clean_latents_post * reference_mask_resized
-
-            # Setting clean_latents
-            clean_latents_post = (reference_latent[:, :, 0:1, :, :].to(history_latents))
-            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-
-            log.info("Kisekaeichi: 2x/4x indices disabled")
-
-            # Processing image embeddings (utilizing both)
-            if (
-                reference_image_encoder_last_hidden_state is not None
-                and start_image_encoder_last_hidden_state is not None
-            ):
-                ref_weight = 0.3
-                input_weight = 1.0 - ref_weight
-                image_encoder_last_hidden_state = (
-                    start_image_encoder_last_hidden_state * input_weight
-                    + reference_image_encoder_last_hidden_state * ref_weight
-                )
-                log.info(f"Image embeddings integrated (input:{input_weight:.2f}, reference:{ref_weight:.2f})")
-            elif reference_image_encoder_last_hidden_state is not None:
-                image_encoder_last_hidden_state = (reference_image_encoder_last_hidden_state)
+            # Splitting when latent_padding_size is 0
+            if latent_padding_size == 0:
+                clean_latent_indices_pre = indices[:, 0:1]
+                latent_indices = indices[:, 1 : 1 + latent_window_size]
+                clean_latent_indices_post = indices[
+                    :, 1 + latent_window_size : 2 + latent_window_size
+                ]
             else:
-                image_encoder_last_hidden_state = (start_image_encoder_last_hidden_state)
+                (
+                    clean_latent_indices_pre,
+                    blank_indices,
+                    latent_indices,
+                    clean_latent_indices_post,
+                    clean_latent_2x_indices,
+                    clean_latent_4x_indices,
+                ) = indices.split(split_sizes, dim=1)
 
-            log.info(f"Kisekaeichi setup complete:")
-            log.info(f"  - clean_latents.shape: {clean_latents.shape} (input+reference)")
-            log.info(f"  - latent_indices: {latent_indices}")
-            log.info(f"  - clean_latent_indices: {clean_latent_indices}")
-            log.info(f"  - sample_num_frames: {sample_num_frames}")
-            log.info(f"  - 2x/4x disabled: True")
+            # one_frame_inference
+            if use_kisekaeichi and reference_latent is not None:
 
-        else:
-            # Normal mode (no reference image)
-            all_indices = torch.arange(0, latent_window_size).unsqueeze(0)
-            latent_indices = all_indices[:, -1:]
+                one_frame_inference = set()
+                one_frame_inference.add(f"target_index={target_index}")
+                one_frame_inference.add(f"history_index={history_index}")
 
-            clean_latents_pre = start_latent.to(torch.float32).cpu()
-            if len(clean_latents_pre.shape) < 5:
-                clean_latents_pre = clean_latents_pre.unsqueeze(2)
+                latent_indices = indices[:, -1:]  # Default is the last frame
 
-            clean_latents_post = torch.zeros_like(clean_latents_pre)
-            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                # Parameter analysis and processing
+                for one_frame_param in one_frame_inference:
+                    if one_frame_param.startswith("target_index="):
+                        target_idx = int(one_frame_param.split("=")[1])
+                        latent_indices[:, 0] = target_idx
+                        log.info(f"Setting latent_indices: target_index={target_idx}")
 
-            # Index adjustment in normal mode
-            clean_latent_indices = torch.tensor([[0]], dtype=clean_latent_indices.dtype, device=clean_latent_indices.device)
-            clean_latents = clean_latents[:, :, :1, :, :]
+                    elif one_frame_param.startswith("history_index="):
+                        history_idx = int(one_frame_param.split("=")[1])
+                        clean_latent_indices_post[:, 0] = history_idx
+                        log.info(f"Setting clean_latent_indices_post: history_index={history_idx}")
 
-            log.info("Kisekaeichi: 2x/4x indices disabled")
+                # dummy history_latents
+                history_latents = torch.zeros(
+                    size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32, device="cpu"
+                )
 
-            image_encoder_last_hidden_state = start_image_encoder_last_hidden_state
+                # Setting clean_latents_pre (input image)
+                clean_latents_pre = start_latent.to(history_latents.dtype).to(
+                    history_latents.device
+                )
+                if len(clean_latents_pre.shape) < 5:
+                    clean_latents_pre = clean_latents_pre.unsqueeze(2)
 
-            log.info("Normal mode settings:")
-            log.info(f"  - clean_latents.shape: {clean_latents.shape}")
-            log.info(f"  - latent_indices: {latent_indices}")
-            log.info(f"  - clean_latent_indices: {clean_latent_indices}")
+                # Applying mask (input image)
+                if input_mask is not None:
+                    height_latent, width_latent = clean_latents_pre.shape[-2:]
+                    input_mask_resized = (common_upscale(input_mask.unsqueeze(0).unsqueeze(0), width_latent,  height_latent, "bilinear", "center").squeeze(0).squeeze(0))
+                    input_mask_resized = input_mask_resized.to(clean_latents_pre.device)[None, None, None, :, :]
+                    clean_latents_pre = clean_latents_pre * input_mask_resized
 
-        # Processing initial samples
-        input_init_latents = None
-        if initial_samples is not None:
-            input_init_latents = initial_samples[:, :, 0:1, :, :].to(device)
+                # Applying mask (reference image)
+                if reference_mask is not None:
+                    height_latent, width_latent = clean_latents_post.shape[-2:]
+                    reference_mask_resized = (common_upscale(input_mask.unsqueeze(0).unsqueeze(0), width_latent,  height_latent, "bilinear", "center").squeeze(0).squeeze(0))
+                    reference_mask_resized = reference_mask_resized.to(clean_latents_post.device)[None, None, None, :, :]
+                    clean_latents_post = clean_latents_post * reference_mask_resized
 
-        # Comfy model config
-        comfy_model = HyVideoModel(
-            HyVideoModelConfig(base_dtype),
-            model_type=comfy.model_base.ModelType.FLOW,
-            device=device,
-        )
-        patcher = comfy.model_patcher.ModelPatcher(
-            comfy_model, device, torch.device("cpu")
-        )
-        from latent_preview import prepare_callback
+                # Setting clean_latents
+                clean_latents_post = (reference_latent[:, :, 0:1, :, :].to(history_latents))
+                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-        callback = prepare_callback(patcher, steps)
+                log.info("Kisekaeichi: 2x/4x indices disabled")
 
-        move_model_to_device_with_memory_preservation(
-            transformer,
-            target_device=device,
-            preserved_memory_gb=gpu_memory_preservation,
-        )
+                # Processing image embeddings (utilizing both)
+                if (
+                    reference_image_encoder_last_hidden_state is not None
+                    and start_image_encoder_last_hidden_state is not None
+                ):
+                    ref_weight = 0.3
+                    input_weight = 1.0 - ref_weight
+                    image_encoder_last_hidden_state = (
+                        start_image_encoder_last_hidden_state * input_weight
+                        + reference_image_encoder_last_hidden_state * ref_weight
+                    )
+                    log.info(f"Image embeddings integrated (input:{input_weight:.2f}, reference:{ref_weight:.2f})")
+                elif reference_image_encoder_last_hidden_state is not None:
+                    image_encoder_last_hidden_state = (reference_image_encoder_last_hidden_state)
+                else:
+                    image_encoder_last_hidden_state = (start_image_encoder_last_hidden_state)
 
-        if use_teacache:
-            transformer.initialize_teacache(
-                enable_teacache=True,
-                num_steps=steps,
-                rel_l1_thresh=teacache_rel_l1_thresh,
-            )
-        else:
-            transformer.initialize_teacache(enable_teacache=False)
+                log.info(f"Kisekaeichi setup complete:")
+                log.info(f"  - clean_latents.shape: {clean_latents.shape} (input+reference)")
+                log.info(f"  - latent_indices: {latent_indices}")
+                log.info(f"  - clean_latent_indices: {clean_latent_indices}")
+                log.info(f"  - sample_num_frames: {sample_num_frames}")
+                log.info(f"  - 2x/4x disabled: True")
 
-        with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
-            generated_latents = sample_hunyuan(
-                transformer=transformer,
-                sampler=sampler,
-                initial_latent=input_init_latents,
-                strength=denoise_strength,
-                width=W * 8,
-                height=H * 8,
-                frames=sample_num_frames, 
-                real_guidance_scale=cfg,
-                distilled_guidance_scale=guidance_scale,
-                guidance_rescale=0,
-                shift=shift if shift != 0 else None,
-                num_inference_steps=steps,
-                generator=rnd,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
+            else:
+                # Normal mode (no reference image)
+                all_indices = torch.arange(0, latent_window_size).unsqueeze(0)
+                latent_indices = all_indices[:, -1:]
+
+                clean_latents_pre = start_latent.to(torch.float32).cpu()
+                if len(clean_latents_pre.shape) < 5:
+                    clean_latents_pre = clean_latents_pre.unsqueeze(2)
+
+                clean_latents_post = torch.zeros_like(clean_latents_pre)
+                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+                # Index adjustment in normal mode
+                clean_latent_indices = torch.tensor([[0]], dtype=clean_latent_indices.dtype, device=clean_latent_indices.device)
+                clean_latents = clean_latents[:, :, :1, :, :]
+
+                log.info("Kisekaeichi: 2x/4x indices disabled")
+
+                image_encoder_last_hidden_state = start_image_encoder_last_hidden_state
+
+                log.info("Normal mode settings:")
+                log.info(f"  - clean_latents.shape: {clean_latents.shape}")
+                log.info(f"  - latent_indices: {latent_indices}")
+                log.info(f"  - clean_latent_indices: {clean_latent_indices}")
+
+            # Processing initial samples
+            input_init_latents = None
+            if initial_samples is not None:
+                input_init_latents = initial_samples[:, :, 0:1, :, :].to(device)
+
+            # Comfy model config
+            comfy_model = HyVideoModel(
+                HyVideoModelConfig(base_dtype),
+                model_type=comfy.model_base.ModelType.FLOW,
                 device=device,
-                dtype=base_dtype,
-                image_embeddings=image_encoder_last_hidden_state,
-                latent_indices=latent_indices,
-                clean_latents=clean_latents,
-                clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=None,
-                clean_latent_2x_indices=None,
-                clean_latents_4x=None,
-                clean_latent_4x_indices=None,
-                callback=callback,
+            )
+            patcher = comfy.model_patcher.ModelPatcher(
+                comfy_model, device, torch.device("cpu")
+            )
+            from latent_preview import prepare_callback
+
+            callback = prepare_callback(patcher, steps)
+
+            move_model_to_device_with_memory_preservation(
+                transformer,
+                target_device=device,
+                preserved_memory_gb=gpu_memory_preservation,
             )
 
-        transformer.to(offload_device)
-        mm.soft_empty_cache()
+            if use_teacache:
+                transformer.initialize_teacache(
+                    enable_teacache=True,
+                    num_steps=steps,
+                    rel_l1_thresh=teacache_rel_l1_thresh,
+                )
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
 
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler=sampler,
+                    initial_latent=input_init_latents,
+                    strength=denoise_strength,
+                    width=W * 8,
+                    height=H * 8,
+                    frames=sample_num_frames, 
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=guidance_scale,
+                    guidance_rescale=0,
+                    shift=shift if shift != 0 else None,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=device,
+                    dtype=base_dtype,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=None,
+                    clean_latent_2x_indices=None,
+                    clean_latents_4x=None,
+                    clean_latent_4x_indices=None,
+                    callback=callback,
+                )
+
+        # Offload transformer to offload_device on the transfer stream
+        with torch.cuda.stream(transfer_stream):
+            offload_model_from_device_for_memory_preservation(transformer, target_device=offload_device, preserved_memory_gb=gpu_memory_preservation, stream=transfer_stream)
+
+        # transformer.to(offload_device)
+        # mm.soft_empty_cache()
+        
+        # Final synchronization
+        torch.cuda.current_stream().wait_stream(compute_stream)
+        torch.cuda.current_stream().wait_stream(transfer_stream)
+        
         return ({"samples": generated_latents / vae_scaling_factor},)
 
 NODE_CLASS_MAPPINGS = {
