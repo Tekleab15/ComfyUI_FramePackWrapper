@@ -369,7 +369,8 @@
         "Node name for S&R": "VAELoader"
       },
       "widgets_values": [
-        "hyvid\\hunyuan_video_vae_bf16_repack.safetensors"
+        // "hyvid\\hunyuan_video_vae_bf16_repack.safetensors"
+        "hunyuan_video_vae_bf16.safetensors"
       ],
       "color": "#322",
       "bgcolor": "#533"
